@@ -3,6 +3,7 @@
 
 use {
     alloc::sync::Arc,
+    bevy_ecs::entity::Entity,
     core::net::{Ipv6Addr, SocketAddr},
     derive_more::{Display, Error},
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
@@ -19,9 +20,14 @@ use {
 /// is created, for example if you want to make sure the request has a valid
 /// [netcode connect token](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md#connect-token)
 /// before accepting it.
+///
+/// The handler also receives the [`Entity`] that will represent this client
+/// session, so it can associate validated handshake data (for example an
+/// authenticated account identity extracted from the request) with the session
+/// before the connection is established.
 #[derive(Clone)]
 pub struct HandshakeHandler(
-    Arc<dyn Fn(&Request, Response) -> Result<Response, ErrorResponse> + Send + Sync>,
+    Arc<dyn Fn(Entity, &Request, Response) -> Result<Response, ErrorResponse> + Send + Sync>,
 );
 
 impl HandshakeHandler {
@@ -52,8 +58,9 @@ impl HandshakeHandler {
     /// fn start(mut commands: Commands, counter: Res<Counter>) {
     ///     let counter = counter.0.clone();
     ///
-    ///     // Define our predicate to check the handshake
-    ///     let predicate = move |req: &Request, mut resp: Response| {
+    ///     // Define our predicate to check the handshake. The first argument is
+    ///     // the `Entity` that will represent this client session.
+    ///     let predicate = move |_session, req: &Request, mut resp: Response| {
     ///         // Use outside state
     ///         let mut counter = counter.write().unwrap();
     ///         info!("Call {}", counter);
@@ -84,14 +91,17 @@ impl HandshakeHandler {
     /// }
     /// ```
     pub fn new(
-        pred: impl Fn(&Request, Response) -> Result<Response, ErrorResponse> + Send + Sync + 'static,
+        pred: impl Fn(Entity, &Request, Response) -> Result<Response, ErrorResponse>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self(Arc::new(pred))
     }
 
     /// Like `Self::new` but uses an existing `Arc`.
     pub fn from_arc(
-        pred: Arc<dyn Fn(&Request, Response) -> Result<Response, ErrorResponse> + Send + Sync>,
+        pred: Arc<dyn Fn(Entity, &Request, Response) -> Result<Response, ErrorResponse> + Send + Sync>,
     ) -> Self {
         Self(pred)
     }
@@ -102,8 +112,13 @@ impl HandshakeHandler {
         reason = "`tokio_tungstenite` requires that we return the error unboxed,
         so we cannot box it here"
     )]
-    pub(crate) fn handle(&self, req: &Request, resp: Response) -> Result<Response, ErrorResponse> {
-        self.0(req, resp)
+    pub(crate) fn handle(
+        &self,
+        session: Entity,
+        req: &Request,
+        resp: Response,
+    ) -> Result<Response, ErrorResponse> {
+        self.0(session, req, resp)
     }
 }
 

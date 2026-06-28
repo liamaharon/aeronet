@@ -114,6 +114,7 @@ async fn accept_session(
         tls_acceptor,
         tx_next,
         handshake_handler,
+        session,
     )
     .instrument(debug_span!("session", %session))
     .await;
@@ -128,6 +129,7 @@ async fn handle_session(
     tls_acceptor: Option<TlsAcceptor>,
     tx_next: oneshot::Sender<ToConnected>,
     handshake_handler: Option<HandshakeHandler>,
+    session: Entity,
 ) -> Result<Never, DisconnectReason> {
     debug!("Performing session handshake");
 
@@ -147,7 +149,7 @@ async fn handle_session(
             reason = "this `Result` is what `tokio_tungstenite` asks for"
         )]
         |req: &Request, resp: Response| match &handshake_handler {
-            Some(h) => h.handle(req, resp),
+            Some(h) => h.handle(session, req, resp),
             None => Ok(resp),
         },
         Some(socket_config),
