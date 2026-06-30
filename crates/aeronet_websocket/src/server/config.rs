@@ -3,6 +3,7 @@
 
 use {
     alloc::sync::Arc,
+    bevy_ecs::{bundle::Bundle, world::EntityWorldMut},
     core::net::{Ipv6Addr, SocketAddr},
     derive_more::{Display, Error},
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
@@ -12,6 +13,12 @@ use {
     },
 };
 
+/// Internal type-erased form of the [`Bundle`] a [`HandshakeHandler`] returns:
+/// a boxed closure that inserts the bundle onto the session entity once it is
+/// set up. The bundle is erased here so the rest of the server stack does not
+/// need to be generic over the bundle type.
+pub(crate) type SessionAttachment = Box<dyn FnOnce(EntityWorldMut) + Send>;
+
 /// Allows inspecting the handshake [`Request`] and conditionally accepting or
 /// denying it based on something like the header.
 ///
@@ -20,9 +27,13 @@ use {
 /// [netcode connect token](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md#connect-token)
 /// before accepting it.
 #[derive(Clone)]
-pub struct HandshakeHandler(
-    Arc<dyn Fn(&Request, Response) -> Result<Response, ErrorResponse> + Send + Sync>,
-);
+pub struct HandshakeHandler(Handler);
+
+type Handler = Arc<
+    dyn Fn(&Request, Response) -> Result<(Response, Option<SessionAttachment>), ErrorResponse>
+        + Send
+        + Sync,
+>;
 
 impl HandshakeHandler {
     /// Create a handshake validator to accept/reject incoming ws connections
@@ -31,6 +42,10 @@ impl HandshakeHandler {
     /// - You can read and write Bevy state by passing shared-mutable-state
     ///   primitives like `Arc<RwLock<..>>` or MPSC channels into the handler.
     /// - The response can be modified before returning.
+    /// - The handler may return a [`Bundle`] (`Some`) to attach to the session
+    ///   entity once it is set up — for example to carry validated handshake
+    ///   data (an authenticated identity) into the ECS — or `None` to attach
+    ///   nothing.
     ///
     /// Example spawning a `WebSocketServer` with handshake validation:
     /// ```rust
@@ -71,7 +86,10 @@ impl HandshakeHandler {
     ///         resp.headers_mut()
     ///             .insert("X-Something", HeaderValue::from_static("Something"));
     ///
-    ///         Ok(resp)
+    ///         // Return the response, plus an optional `Bundle` to attach to
+    ///         // the session entity (`None` here; the empty bundle `()` fixes
+    ///         // the type). Return `Some(my_component)` to attach instead.
+    ///         Ok((resp, None::<()>))
     ///     };
     ///     let handshake_handler = HandshakeHandler::new(predicate);
     ///
@@ -83,26 +101,37 @@ impl HandshakeHandler {
     ///     commands.spawn_empty().queue(WebSocketServer::open(config));
     /// }
     /// ```
-    pub fn new(
-        pred: impl Fn(&Request, Response) -> Result<Response, ErrorResponse> + Send + Sync + 'static,
+    pub fn new<B: Bundle>(
+        pred: impl Fn(&Request, Response) -> Result<(Response, Option<B>), ErrorResponse>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
-        Self(Arc::new(pred))
+        // Erase the bundle into a boxed inserter so the rest of the server stack
+        // stays non-generic over `B`.
+        Self(Arc::new(move |req, resp| {
+            let (resp, bundle) = pred(req, resp)?;
+            let attachment = bundle.map(|bundle| -> SessionAttachment {
+                Box::new(move |mut entity: EntityWorldMut| {
+                    entity.insert(bundle);
+                })
+            });
+            Ok((resp, attachment))
+        }))
     }
 
-    /// Like `Self::new` but uses an existing `Arc`.
-    pub fn from_arc(
-        pred: Arc<dyn Fn(&Request, Response) -> Result<Response, ErrorResponse> + Send + Sync>,
-    ) -> Self {
-        Self(pred)
-    }
-
-    /// Handle a request, returning a response.
+    /// Handle a request, returning a response and an optional attachment to
+    /// apply to the session entity.
     #[expect(
         clippy::result_large_err,
         reason = "`tokio_tungstenite` requires that we return the error unboxed,
         so we cannot box it here"
     )]
-    pub(crate) fn handle(&self, req: &Request, resp: Response) -> Result<Response, ErrorResponse> {
+    pub(crate) fn handle(
+        &self,
+        req: &Request,
+        resp: Response,
+    ) -> Result<(Response, Option<SessionAttachment>), ErrorResponse> {
         self.0(req, resp)
     }
 }

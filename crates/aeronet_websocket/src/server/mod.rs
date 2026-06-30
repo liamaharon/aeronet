@@ -174,10 +174,22 @@ struct ToConnecting {
     rx_next: oneshot::Receiver<ToConnected>,
 }
 
-#[derive(Debug)]
 struct ToConnected {
     peer_addr: SocketAddr,
     frontend: SessionFrontend,
+    /// Optional components to attach to the session entity once it is set up,
+    /// produced by the [`HandshakeHandler`].
+    attachment: Option<SessionAttachment>,
+}
+
+impl core::fmt::Debug for ToConnected {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ToConnected")
+            .field("peer_addr", &self.peer_addr)
+            .field("frontend", &self.frontend)
+            .field("has_attachment", &self.attachment.is_some())
+            .finish()
+    }
 }
 
 fn poll_opening(
@@ -264,7 +276,8 @@ fn poll_connecting(
 
         let (_, dummy) = oneshot::channel();
         let rx_dc_reason = mem::replace(&mut client_io.rx_dc_reason, dummy);
-        commands.entity(client).remove::<Connecting>().insert((
+        let mut entity = commands.entity(client);
+        entity.remove::<Connecting>().insert((
             WebSocketIo {
                 rx_packet_b2f: next.frontend.rx_packet_b2f,
                 tx_packet_f2b: next.frontend.tx_packet_f2b,
@@ -273,6 +286,11 @@ fn poll_connecting(
             Connected { rx_dc_reason },
             PeerAddr(next.peer_addr),
         ));
+        // Apply any components the handshake handler associated with this
+        // session (e.g. an authenticated identity extracted from the request).
+        if let Some(attachment) = next.attachment {
+            entity.queue(attachment);
+        }
     }
 }
 

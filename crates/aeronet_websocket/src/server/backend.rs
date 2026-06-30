@@ -1,5 +1,5 @@
 use {
-    super::{ServerConfig, ServerError, ToConnected, ToOpen},
+    super::{ServerConfig, ServerError, SessionAttachment, ToConnected, ToOpen},
     crate::{
         server::{HandshakeHandler, ToConnecting},
         session::SessionError,
@@ -140,6 +140,10 @@ async fn handle_session(
     } else {
         MaybeTlsStream::Plain(stream)
     };
+    // The handshake handler may return a `SessionAttachment` to apply to the
+    // session entity. tokio_tungstenite's callback can only return the response,
+    // so capture the attachment here and forward it on `ToConnected`.
+    let mut attachment: Option<SessionAttachment> = None;
     let stream = tokio_tungstenite::accept_hdr_async_with_config(
         stream,
         #[expect(
@@ -147,7 +151,11 @@ async fn handle_session(
             reason = "this `Result` is what `tokio_tungstenite` asks for"
         )]
         |req: &Request, resp: Response| match &handshake_handler {
-            Some(h) => h.handle(req, resp),
+            Some(h) => {
+                let (resp, attach) = h.handle(req, resp)?;
+                attachment = attach;
+                Ok(resp)
+            }
             None => Ok(resp),
         },
         Some(socket_config),
@@ -159,6 +167,7 @@ async fn handle_session(
     let connected = ToConnected {
         peer_addr,
         frontend,
+        attachment,
     };
     debug!("Connected");
 
