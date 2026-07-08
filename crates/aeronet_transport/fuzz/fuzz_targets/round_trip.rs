@@ -29,7 +29,8 @@ fuzz_target!(|input: (LaneKind, &[u8])| {
     let msg = Bytes::from(msg.to_vec());
     _ = transport.send.push(lane_index, msg, now).unwrap();
 
-    let packets = aeronet_transport::send::flush_on(&mut transport, now, MTU).collect::<Vec<_>>();
+    let packets =
+        aeronet_transport::send::flush_on(&mut transport, now, MTU, None).collect::<Vec<_>>();
     for packet in packets {
         aeronet_transport::recv::recv_on(&mut transport, &TransportConfig::default(), now, &packet)
             .unwrap();

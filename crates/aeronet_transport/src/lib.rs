@@ -36,7 +36,7 @@ use {
     bevy_ecs::{prelude::*, schedule::SystemSet},
     bevy_platform::time::Instant,
     bevy_reflect::Reflect,
-    core::num::Saturating,
+    core::{num::Saturating, time::Duration},
     derive_more::{Add, AddAssign, Display, Error, Sub, SubAssign},
     lane::{LaneIndex, LaneKind},
     log::warn,
@@ -120,6 +120,21 @@ pub struct Transport {
     stats: MessageStats,
     peer_acks: Acknowledge,
     rtt: RttEstimator,
+    /// Whether we have received an ack-eliciting (fragment-bearing) packet from
+    /// the peer since our last flush, and therefore owe them an
+    /// acknowledgement.
+    ///
+    /// Header-only packets (pure acks / keepalives) are *not* ack-eliciting, so
+    /// they never set this flag. This is what prevents an ack-of-ack ping-pong
+    /// when [`TransportConfig::heartbeat_interval`] is used to suppress idle
+    /// sends (see RFC 9002's ack-eliciting packet concept).
+    owe_ack: bool,
+    /// Instant at which we last flushed a packet out to the peer.
+    ///
+    /// Used together with [`TransportConfig::heartbeat_interval`] to decide
+    /// when to send a header-only keepalive packet during idle periods.
+    #[typesize(with = crate::size::of_instant)]
+    last_flush_at: Instant,
     /// Interface to the receiving half of this transport.
     ///
     /// Use this to read received messages and acknowledgements.
@@ -174,6 +189,33 @@ pub struct TransportConfig {
     ///
     /// [`SessionStatsSample::loss`]: crate::sampling::SessionStatsSample::loss
     pub packet_lost_threshold_factor: f64,
+    /// How long the transport may stay silent before it flushes a header-only
+    /// keepalive packet, if there is no other reason to send.
+    ///
+    /// By default this is [`None`], which preserves the legacy behavior of
+    /// flushing at least one packet on *every* update (typically the
+    /// render/tick rate). This keeps acknowledgements, RTT samples, and
+    /// loss estimates fresh at the cost of a steady stream of tiny packets
+    /// even when idle.
+    ///
+    /// Set this to [`Some`] to suppress those idle packets: a packet is then
+    /// only flushed when there are messages to send, when we owe the peer an
+    /// acknowledgement for ack-eliciting data we received, or when this
+    /// interval has elapsed since the last flush. This can drastically cut
+    /// idle bandwidth and CPU/battery use for applications with sparse
+    /// traffic.
+    ///
+    /// # Trade-offs
+    ///
+    /// While idle, RTT samples and packet-loss estimates
+    /// ([`SessionStatsSample`]) are only refreshed about once per interval, so
+    /// they become coarser. Delivery guarantees are unaffected: reliable
+    /// retransmission and ordering still work, and acknowledgements for
+    /// received data are still sent promptly (they are not gated by this
+    /// interval).
+    ///
+    /// [`SessionStatsSample`]: crate::sampling::SessionStatsSample
+    pub heartbeat_interval: Option<Duration>,
 }
 
 impl Default for TransportConfig {
@@ -182,6 +224,7 @@ impl Default for TransportConfig {
             max_memory_usage: 4 * 1024 * 1024,
             tx_bytes_per_sec: usize::MAX,
             packet_lost_threshold_factor: 1.5,
+            heartbeat_interval: None,
         }
     }
 }
@@ -258,6 +301,8 @@ impl Transport {
             stats: MessageStats::default(),
             peer_acks: Acknowledge::default(),
             rtt: RttEstimator::default(),
+            owe_ack: false,
+            last_flush_at: now,
             recv: TransportRecv::new(recv_lanes),
             send: TransportSend::new(max_frag_len, send_lanes),
         })

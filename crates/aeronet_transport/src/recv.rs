@@ -242,6 +242,15 @@ pub fn recv_on(
         packet.len()
     );
 
+    // A packet is "ack-eliciting" if it carries any fragment bytes after the
+    // header. Header-only packets (pure acks / keepalives) are not, so they do
+    // not obligate us to send an acknowledgement back - this is what breaks the
+    // ack-of-ack ping-pong when idle sends are suppressed via
+    // `TransportConfig::heartbeat_interval`.
+    if packet.has_remaining() {
+        transport.owe_ack = true;
+    }
+
     transport.peer_acks.ack(header.seq);
     transport.recv.acks.0.extend(packet_acks_to_msg_keys(
         &mut transport.flushed_packets,

@@ -24,7 +24,7 @@ use {
         time::Instant,
     },
     bevy_time::{Real, Time},
-    core::iter,
+    core::{iter, time::Duration},
     derive_more::{Display, Error, From},
     log::trace,
     octs::{Bytes, EncodeLen, Write},
@@ -293,13 +293,14 @@ pub(crate) fn refill_send_bytes(time: Res<Time<Real>>, mut sessions: Query<&mut 
     });
 }
 
-pub(crate) fn flush(mut sessions: Query<(&mut Session, &mut Transport)>) {
+pub(crate) fn flush(mut sessions: Query<(&mut Session, &mut Transport, &TransportConfig)>) {
     let now = Instant::now();
     sessions
         .par_iter_mut()
-        .for_each(|(mut session, mut transport)| {
+        .for_each(|(mut session, mut transport, config)| {
             let packet_mtu = session.mtu();
-            let packets = flush_on(&mut transport, now, packet_mtu);
+            let heartbeat_interval = config.heartbeat_interval;
+            let packets = flush_on(&mut transport, now, packet_mtu, heartbeat_interval);
             session.send.extend(packets);
         });
 }
@@ -313,11 +314,18 @@ pub(crate) fn flush(mut sessions: Query<(&mut Session, &mut Transport)>) {
 /// Every update, for all [`Session`]s with an associated [`Transport`], this
 /// function is used to build packets from the transport's fragments pending
 /// for sending, and those packets are pushed into the session's send buffer.
+///
+/// `heartbeat_interval` mirrors [`TransportConfig::heartbeat_interval`]. When
+/// it is [`None`], at least one packet is always emitted (legacy behavior).
+/// When it is [`Some`], a packet is only emitted if there are fragments to
+/// send, we owe the peer an acknowledgement, or the interval has elapsed since
+/// the last flush - so a fully idle transport emits nothing.
 #[expect(clippy::missing_panics_doc, reason = "shouldn't panic")]
 pub fn flush_on(
     transport: &mut Transport,
     now: Instant,
     mtu: usize,
+    heartbeat_interval: Option<Duration>,
 ) -> impl Iterator<Item = Bytes> + '_ {
     // collect the paths of the frags to send, along with how old they are
     let mut frag_paths = transport
@@ -335,6 +343,17 @@ pub fn flush_on(
         .into_iter()
         .map(|(path, _)| Some(path))
         .collect::<Vec<_>>();
+
+    // Decide whether we must emit at least one packet this flush. When
+    // `heartbeat_interval` is `None` we always emit (legacy behavior). Otherwise
+    // we only emit if there is a real reason to: pending fragments, an
+    // acknowledgement we owe the peer, or the heartbeat interval has elapsed.
+    let have_pending_frags = frag_paths.iter().any(Option::is_some);
+    let heartbeat_due = match heartbeat_interval {
+        None => true,
+        Some(interval) => now.saturating_duration_since(transport.last_flush_at) >= interval,
+    };
+    let must_emit = have_pending_frags || transport.owe_ack || heartbeat_due;
 
     let mut sent_packet_yet = false;
     iter::from_fn(move || {
@@ -388,7 +407,7 @@ pub fn flush_on(
             }
         }
 
-        let should_send = !packet_frags.is_empty() || !sent_packet_yet;
+        let should_send = !packet_frags.is_empty() || (!sent_packet_yet && must_emit);
         if !should_send {
             return None;
         }
@@ -408,6 +427,10 @@ pub fn flush_on(
 
         transport.send.next_packet_seq += PacketSeq::new(1);
         sent_packet_yet = true;
+        // This packet's header carries our current acks, so we no longer owe the
+        // peer one, and it resets the idle heartbeat timer.
+        transport.owe_ack = false;
+        transport.last_flush_at = now;
         Some(Bytes::from(packet))
     })
 }
@@ -512,20 +535,23 @@ fn write_frag_at_path(
 mod tests {
     use {
         crate::{
-            Transport,
+            Transport, TransportConfig,
             lane::{LaneIndex, LaneKind},
             packet::{
                 Acknowledge, Fragment, FragmentHeader, FragmentPayload, FragmentPosition,
                 MessageSeq, PacketHeader, PacketSeq,
             },
+            recv::recv_on,
         },
         aeronet_io::Session,
         bevy_platform::time::Instant,
+        core::time::Duration,
         octs::{Bytes, Read},
     };
 
     const LANES: [LaneKind; 1] = [LaneKind::ReliableOrdered];
     const LANE: LaneIndex = LaneIndex::new(0);
+    const HEARTBEAT: Duration = Duration::from_secs(5);
 
     #[test]
     fn send_some_data() {
@@ -549,7 +575,7 @@ mod tests {
             .unwrap();
         assert_eq!(1, transport.send.lanes().first().unwrap().num_queued_msgs());
 
-        let mut packets = super::flush_on(&mut transport, now, 1024);
+        let mut packets = super::flush_on(&mut transport, now, 1024, None);
         let mut packet = packets.next().unwrap();
         assert!(packets.next().is_none());
 
@@ -570,6 +596,143 @@ mod tests {
                 },
                 payload: FragmentPayload::new(Bytes::from_static(msg)).unwrap(),
             }
+        );
+    }
+
+    fn new_transport(now: Instant) -> Transport {
+        let session = Session::new(now, 1024);
+        Transport::new(&session, LANES, LANES, now).unwrap()
+    }
+
+    /// With `heartbeat_interval = None`, an idle transport still flushes one
+    /// header-only packet every update (legacy behavior).
+    #[test]
+    fn legacy_none_always_emits() {
+        let now = Instant::now();
+        let mut transport = new_transport(now);
+
+        assert_eq!(1, super::flush_on(&mut transport, now, 1024, None).count());
+    }
+
+    /// With a heartbeat interval set, an idle transport (no frags, no owed
+    /// acks, heartbeat not yet due) flushes nothing.
+    #[test]
+    fn idle_with_heartbeat_emits_nothing() {
+        let now = Instant::now();
+        let mut transport = new_transport(now);
+
+        assert!(
+            super::flush_on(&mut transport, now, 1024, Some(HEARTBEAT))
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Once the heartbeat interval has elapsed since the last flush, exactly
+    /// one header-only keepalive packet is emitted, and the timer resets so
+    /// the next idle flush emits nothing again.
+    #[test]
+    fn heartbeat_emits_after_interval() {
+        let start = Instant::now();
+        let mut transport = new_transport(start);
+
+        let due = start + HEARTBEAT + Duration::from_millis(1);
+        assert_eq!(
+            1,
+            super::flush_on(&mut transport, due, 1024, Some(HEARTBEAT)).count()
+        );
+
+        // timer reset: flushing again immediately emits nothing
+        assert!(
+            super::flush_on(&mut transport, due, 1024, Some(HEARTBEAT))
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Pending fragments are always flushed, even when idle sends are
+    /// suppressed and the heartbeat is not due.
+    #[test]
+    fn pending_frags_emit_when_suppressed() {
+        let now = Instant::now();
+        let mut transport = new_transport(now);
+        transport
+            .send
+            .push(LANE, Bytes::from_static(b"hello"), now)
+            .unwrap();
+
+        assert_eq!(
+            1,
+            super::flush_on(&mut transport, now, 1024, Some(HEARTBEAT)).count()
+        );
+    }
+
+    /// Receiving an ack-eliciting (fragment-bearing) packet makes us owe the
+    /// peer an ack, which forces a flush even while idle sends are suppressed;
+    /// the flush then clears the owed ack.
+    #[test]
+    fn owe_ack_triggers_emit_then_clears() {
+        let now = Instant::now();
+
+        // build a real ack-eliciting packet from a sender
+        let mut sender = new_transport(now);
+        sender
+            .send
+            .push(LANE, Bytes::from_static(b"hi"), now)
+            .unwrap();
+        let ack_eliciting = super::flush_on(&mut sender, now, 1024, Some(HEARTBEAT))
+            .next()
+            .expect("should emit a packet carrying the fragment");
+
+        let mut receiver = new_transport(now);
+        let config = TransportConfig::default();
+        recv_on(&mut receiver, &config, now, &ack_eliciting).unwrap();
+        assert!(
+            receiver.owe_ack,
+            "fragment-bearing packet should oblige an ack"
+        );
+
+        // owing an ack forces a flush even though the heartbeat is not due
+        assert_eq!(
+            1,
+            super::flush_on(&mut receiver, now, 1024, Some(HEARTBEAT)).count()
+        );
+        assert!(!receiver.owe_ack, "flushing should discharge the owed ack");
+
+        // and the next idle flush is silent again
+        assert!(
+            super::flush_on(&mut receiver, now, 1024, Some(HEARTBEAT))
+                .next()
+                .is_none()
+        );
+    }
+
+    /// Ping-pong guard: receiving a header-only packet (a pure ack / keepalive)
+    /// must NOT make us owe an ack, otherwise two idle peers would volley acks
+    /// forever.
+    #[test]
+    fn header_only_recv_does_not_owe_ack() {
+        let now = Instant::now();
+
+        // a header-only packet: flush an idle transport with legacy behavior
+        let mut sender = new_transport(now);
+        let header_only = super::flush_on(&mut sender, now, 1024, None)
+            .next()
+            .expect("legacy flush should emit a header-only packet");
+
+        let mut receiver = new_transport(now);
+        let config = TransportConfig::default();
+        recv_on(&mut receiver, &config, now, &header_only).unwrap();
+        assert!(
+            !receiver.owe_ack,
+            "header-only packet must not oblige an ack"
+        );
+
+        // therefore the receiver stays silent while idle
+        assert!(
+            super::flush_on(&mut receiver, now, 1024, Some(HEARTBEAT))
+                .next()
+                .is_none()
         );
     }
 }
